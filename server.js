@@ -98,6 +98,7 @@ const initDatabase = async () => {
             grand_total REAL,
             total_import_cost REAL,
             items_detail TEXT,
+            payment_method TEXT DEFAULT 'Tiền mặt',
             created_date TEXT
         )`);
 
@@ -282,7 +283,62 @@ app.post('/api/rooms/cancel-booking', async (req, res) => {
     }
 });
 
-app.post('/api/rooms/checkout', async (req, res) => {
+// Cho phép khách hàng xem bill tạm tính (không kết thúc phòng)
+app.get('/api/rooms/temp-bill/:room_id', async (req, res) => {
+    const { room_id } = req.params;
+    try {
+        const settingRes = await pool.query(`SELECT * FROM settings LIMIT 1`);
+        const setting = settingRes.rows[0];
+
+        const roomRes = await pool.query(`SELECT * FROM rooms WHERE id = $1`, [room_id]);
+        const room = roomRes.rows[0];
+
+        if (!room || room.status === 'Trống') return res.status(400).json({ error: 'Phòng đang trống!' });
+
+        const startTime = room.start_time ? new Date(room.start_time) : new Date();
+        const now = new Date();
+        const hours = Math.max(0.2, (now - startTime) / (1000 * 60 * 60));
+        const roomTotal = hours * room.price_per_hour;
+
+        const orderRes = await pool.query(`SELECT o.*, m.item_name, m.category, m.unit, m.import_price FROM orders o JOIN menu m ON o.item_id = m.id WHERE o.room_id = $1`, [room_id]);
+        const orderItems = orderRes.rows || [];
+
+        const foodItems = orderItems.filter(i => i.category === 'food');
+        const drinkItems = orderItems.filter(i => i.category === 'drink');
+        const otherItems = orderItems.filter(i => i.category === 'khác');
+
+        const serviceTotal = orderItems.reduce((sum, item) => sum + item.total_price, 0);
+        const subTotal = roomTotal + serviceTotal;
+        
+        const discountPercent = Number(setting?.promo_discount || 0);
+        const discountAmount = (subTotal * discountPercent) / 100;
+        const grandTotal = subTotal - discountAmount;
+
+        res.json({
+            success: true,
+            setting: setting || {},
+            report: {
+                room_name: room.room_name,
+                hours: hours.toFixed(2),
+                price_per_hour: room.price_per_hour,
+                roomTotal: roomTotal.toFixed(0),
+                foodItems,
+                drinkItems,
+                otherItems,
+                serviceTotal: serviceTotal.toFixed(0),
+                subTotal: subTotal.toFixed(0),
+                discountPercent,
+                discountAmount: discountAmount.toFixed(0),
+                grandTotal: grandTotal.toFixed(0)
+            }
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Bước 1 của Nhân viên/Admin: Tính tiền tạm thời để kiểm tra hóa đơn trước khi xác nhận thanh toán
+app.post('/api/rooms/checkout-preview', async (req, res) => {
     const { room_id } = req.body;
     try {
         const settingRes = await pool.query(`SELECT * FROM settings LIMIT 1`);
@@ -312,21 +368,9 @@ app.post('/api/rooms/checkout', async (req, res) => {
         const discountAmount = (subTotal * discountPercent) / 100;
         const grandTotal = subTotal - discountAmount;
 
-        const totalImportCost = orderItems.reduce((sum, item) => sum + (item.import_price * item.quantity), 0);
-        const currentDate = new Date().toISOString().split('T')[0];
-
-        await pool.query(`INSERT INTO bills (room_name, hours, room_total, service_total, grand_total, total_import_cost, items_detail, created_date) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-            [room.room_name, hours.toFixed(2), roomTotal, serviceTotal, grandTotal, totalImportCost, JSON.stringify(orderItems), currentDate]);
-        
-        for (const item of orderItems) {
-            await pool.query(`UPDATE inventory SET quantity = GREATEST(0, quantity - $1) WHERE item_name = $2`, [item.quantity, item.item_name]);
-        }
-
-        await pool.query(`UPDATE rooms SET status = 'Trống', booking_type = NULL, customer_name = NULL, customer_phone = NULL, customer_cccd = NULL, start_time = NULL, booked_slots = '[]' WHERE id = $1`, [room_id]);
-        await pool.query(`DELETE FROM orders WHERE room_id = $1`, [room_id]);
-
         res.json({
             success: true,
+            room_id,
             setting: setting || {},
             report: {
                 room_name: room.room_name,
@@ -340,9 +384,40 @@ app.post('/api/rooms/checkout', async (req, res) => {
                 subTotal: subTotal.toFixed(0),
                 discountPercent,
                 discountAmount: discountAmount.toFixed(0),
-                grandTotal: grandTotal.toFixed(0)
+                grandTotal: grandTotal.toFixed(0),
+                orderItems
             }
         });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Bước 2 của Nhân viên/Admin: Xác thực phương thức thanh toán (Chuyển khoản hoặc Tiền mặt) rồi hoàn tất checkout
+app.post('/api/rooms/checkout-confirm', async (req, res) => {
+    const { room_id, payment_method, report } = req.body;
+    try {
+        const roomRes = await pool.query(`SELECT * FROM rooms WHERE id = $1`, [room_id]);
+        const room = roomRes.rows[0];
+        if (!room) return res.status(400).json({ error: 'Phòng không tồn tại!' });
+
+        const totalImportCost = report.orderItems.reduce((sum, item) => sum + (item.import_price * item.quantity), 0);
+        const currentDate = new Date().toISOString().split('T')[0];
+
+        // Lưu hóa đơn kèm theo payment_method vào database
+        await pool.query(`INSERT INTO bills (room_name, hours, room_total, service_total, grand_total, total_import_cost, items_detail, payment_method, created_date) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+            [room.room_name, report.hours, report.roomTotal, report.serviceTotal, report.grandTotal, totalImportCost, JSON.stringify(report.orderItems), payment_method || 'Tiền mặt', currentDate]);
+        
+        // Trừ tồn kho
+        for (const item of report.orderItems) {
+            await pool.query(`UPDATE inventory SET quantity = GREATEST(0, quantity - $1) WHERE item_name = $2`, [item.quantity, item.item_name]);
+        }
+
+        // Giải phóng phòng
+        await pool.query(`UPDATE rooms SET status = 'Trống', booking_type = NULL, customer_name = NULL, customer_phone = NULL, customer_cccd = NULL, start_time = NULL, booked_slots = '[]' WHERE id = $1`, [room_id]);
+        await pool.query(`DELETE FROM orders WHERE room_id = $1`, [room_id]);
+
+        res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -352,7 +427,10 @@ app.post('/api/rooms/checkout', async (req, res) => {
 app.get('/api/reports/revenue', async (req, res) => {
     const { start_date, end_date } = req.query;
     try {
-        let billQuery = `SELECT SUM(grand_total) as totalRevenue FROM bills`;
+        let billQuery = `SELECT SUM(grand_total) as totalrevenue, 
+                                SUM(CASE WHEN payment_method = 'Chuyển khoản' THEN grand_total ELSE 0 END) as totaltransfer,
+                                SUM(CASE WHEN payment_method = 'Tiền mặt' OR payment_method IS NULL THEN grand_total ELSE 0 END) as totalcash 
+                         FROM bills`;
         let expQuery = `SELECT category, SUM(amount) as totalExp FROM expenses`;
         let params = [];
 
@@ -364,11 +442,13 @@ app.get('/api/reports/revenue', async (req, res) => {
         expQuery += ` GROUP BY category`;
 
         const billRes = await pool.query(billQuery, params);
-        const invRes = await pool.query(`SELECT SUM(quantity * import_price) as totalInventoryValue FROM inventory`);
+        const invRes = await pool.query(`SELECT SUM(quantity * import_price) as totalinventoryvalue FROM inventory`);
         const expRes = await pool.query(expQuery, params);
 
-        const totalRevenue = billRes.rows[0]?.totalrevenue || 0;
-        const totalImport = invRes.rows[0]?.totalinventoryvalue || 0;
+        const totalRevenue = Number(billRes.rows[0]?.totalrevenue || 0);
+        const totalTransfer = Number(billRes.rows[0]?.totaltransfer || 0);
+        const totalCash = Number(billRes.rows[0]?.totalcash || 0);
+        const totalImport = Number(invRes.rows[0]?.totalinventoryvalue || 0);
         const grossProfit = totalRevenue - totalImport;
 
         let expenses = {
@@ -382,7 +462,7 @@ app.get('/api/reports/revenue', async (req, res) => {
         });
 
         const netProfit = grossProfit - totalExpense;
-        res.json({ totalRevenue, totalImport, grossProfit, expenses, totalExpense, netProfit });
+        res.json({ totalRevenue, totalTransfer, totalCash, totalImport, grossProfit, expenses, totalExpense, netProfit });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
