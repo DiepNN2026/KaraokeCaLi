@@ -14,9 +14,9 @@ app.use(express.static(path.join(__dirname, 'public')));
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: {
-        rejectUnauthorized: false // Bắt buộc khi kết nối Supabase từ bên ngoài
+        rejectUnauthorized: false // Bắt buộc khi kết nối Supabase từ bên ngoài[cite: 3]
     },
-    family: 4 // Ép buộc sử dụng IPv4 để tránh lỗi ENETUNREACH trên Render
+    family: 4 // Ép buộc sử dụng IPv4 để tránh lỗi ENETUNREACH trên Render[cite: 3]
 });
 
 pool.connect((err) => {
@@ -101,6 +101,9 @@ const initDatabase = async () => {
             payment_method TEXT DEFAULT 'Tiền mặt',
             created_date TEXT
         )`);
+
+        // Tự động bổ sung cột payment_method nếu bảng bills cũ chưa có cột này
+        await pool.query(`ALTER TABLE bills ADD COLUMN IF NOT EXISTS payment_method TEXT DEFAULT 'Tiền mặt'`);
 
         await pool.query(`CREATE TABLE IF NOT EXISTS expenses (
             id SERIAL PRIMARY KEY,
