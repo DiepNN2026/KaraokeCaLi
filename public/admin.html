@@ -179,7 +179,7 @@
                 <div class="card p-4">
                     <div class="d-flex justify-content-between align-items-center mb-3">
                         <h4 class="mb-0">Báo Cáo Doanh Thu & Lợi Nhuận</h4>
-                        <button class="btn btn-success fw-bold" onclick="exportExcelMultiSheet()">📥 Xuất Excel (Đa Sheet)</button>
+                        <button class="btn btn-success fw-bold" onclick="exportExcelMultiSheet()">📥 Xuất Excel (Đa Sheet - Có Đóng Khung)</button>
                     </div>
                     <div class="row g-3 mb-4 align-items-end">
                         <div class="col-md-4"><label class="form-label">Từ ngày:</label><input type="date" id="rep-start" class="form-control"></div>
@@ -192,6 +192,11 @@
                             <div class="p-3 bg-light border rounded shadow-sm" style="cursor:pointer;" onclick="openBillsDetailModal()" title="Nhấp để xem chi tiết bill">
                                 <h6 class="text-muted">Tổng Doanh Thu <small class="text-primary">(Xem chi tiết)</small></h6>
                                 <h4 class="text-primary fw-bold" id="rep-revenue">0đ</h4>
+                                <!-- Thêm thông tin chi tiết Chuyển khoản / Tiền mặt -->
+                                <div class="mt-2 text-start small border-top pt-1">
+                                    <div>💳 Chuyển khoản: <b id="rep-transfer" class="text-success">0đ</b></div>
+                                    <div>💵 Tiền mặt: <b id="rep-cash" class="text-dark">0đ</b></div>
+                                </div>
                             </div>
                         </div>
                         <div class="col-md-3"><div class="p-3 bg-light border rounded"><h6 class="text-muted">Giá Vốn Hàng Bán (Tồn Kho)</h6><h4 class="text-danger fw-bold" id="rep-import">0đ</h4></div></div>
@@ -242,6 +247,7 @@
                                     <th>Ngày thanh toán</th>
                                     <th>Phòng</th>
                                     <th>Thời gian hát</th>
+                                    <th>PT Thanh Toán</th>
                                     <th>Tổng thanh toán</th>
                                     <th>Thao tác</th>
                                 </tr>
@@ -399,6 +405,8 @@
             cachedReportData = await res.json();
 
             document.getElementById('rep-revenue').innerText = Number(cachedReportData.totalRevenue).toLocaleString() + 'đ';
+            document.getElementById('rep-transfer').innerText = Number(cachedReportData.totalTransfer || 0).toLocaleString() + 'đ';
+            document.getElementById('rep-cash').innerText = Number(cachedReportData.totalCash || 0).toLocaleString() + 'đ';
             document.getElementById('rep-import').innerText = Number(cachedReportData.totalImport).toLocaleString() + 'đ';
             document.getElementById('rep-expense').innerText = Number(cachedReportData.totalExpense).toLocaleString() + 'đ';
             document.getElementById('rep-net').innerText = Number(cachedReportData.netProfit).toLocaleString() + 'đ';
@@ -416,13 +424,14 @@
         }
 
         async function openBillsDetailModal() {
-            document.getElementById('modal-bills-list').innerHTML = cachedBills.length === 0 ? `<tr><td colspan="6" class="text-center text-muted">Không có dữ liệu hóa đơn trong khoảng thời gian này</td></tr>` :
+            document.getElementById('modal-bills-list').innerHTML = cachedBills.length === 0 ? `<tr><td colspan="7" class="text-center text-muted">Không có dữ liệu hóa đơn trong khoảng thời gian này</td></tr>` :
                 cachedBills.map(b => `
                     <tr>
                         <td>#${b.id}</td>
                         <td>${b.created_date}</td>
                         <td><b>${b.room_name}</b></td>
                         <td>${b.hours}h</td>
+                        <td><span class="badge ${b.payment_method === 'Chuyển khoản' ? 'bg-success' : 'bg-dark'}">${b.payment_method || 'Tiền mặt'}</span></td>
                         <td class="text-danger fw-bold">${Number(b.grand_total).toLocaleString()}đ</td>
                         <td>
                             <button class="btn btn-sm btn-primary" onclick='printBillFromReport(${JSON.stringify(b)})'>🖨️ Xem & In Bill</button>
@@ -481,16 +490,39 @@
             new bootstrap.Modal(document.getElementById('billModal')).show();
         }
 
+        // Hàm hỗ trợ áp dụng đóng khung (border) cho toàn bộ các ô trong một sheet
+        function applySheetBorder(ws) {
+            if (!ws['!ref']) return;
+            const range = XLSX.utils.decode_range(ws['!ref']);
+            const thinBorder = {
+                top: { style: 'thin', color: { rgb: "000000" } },
+                bottom: { style: 'thin', color: { rgb: "000000" } },
+                left: { style: 'thin', color: { rgb: "000000" } },
+                right: { style: 'thin', color: { rgb: "000000" } }
+            };
+            for (let R = range.s.r; R <= range.e.r; ++R) {
+                for (let C = range.s.c; C <= range.e.c; ++C) {
+                    const cellAddress = XLSX.utils.encode_cell({ r: R, c: C });
+                    if (!ws[cellAddress]) continue;
+                    if (!ws[cellAddress].s) ws[cellAddress].s = {};
+                    ws[cellAddress].s.border = thinBorder;
+                }
+            }
+        }
+
         function exportExcelMultiSheet() {
             const wb = XLSX.utils.book_new();
 
             const reportSummary = [
                 { "Chỉ tiêu": "Tổng Doanh Thu", "Giá trị (VNĐ)": cachedReportData?.totalRevenue || 0 },
+                { "Chỉ tiêu": "  + Doanh thu Chuyển khoản", "Giá trị (VNĐ)": cachedReportData?.totalTransfer || 0 },
+                { "Chỉ tiêu": "  + Doanh thu Tiền mặt", "Giá trị (VNĐ)": cachedReportData?.totalCash || 0 },
                 { "Chỉ tiêu": "Giá Vốn Hàng Bán (Giá trị tồn kho)", "Giá trị (VNĐ)": cachedReportData?.totalImport || 0 },
                 { "Chỉ tiêu": "Tổng Chi Phí", "Giá trị (VNĐ)": cachedReportData?.totalExpense || 0 },
                 { "Chỉ tiêu": "Lợi Nhuận Thuần", "Giá trị (VNĐ)": cachedReportData?.netProfit || 0 }
             ];
             const wsReport = XLSX.utils.json_to_sheet(reportSummary);
+            applySheetBorder(wsReport);
             XLSX.utils.book_append_sheet(wb, wsReport, "BaoCao_TongQuan");
 
             const wsBills = XLSX.utils.json_to_sheet(cachedBills.map(b => ({
@@ -498,10 +530,12 @@
                 "Ngày": b.created_date,
                 "Phòng": b.room_name,
                 "Số giờ": b.hours,
+                "PT Thanh Toán": b.payment_method || 'Tiền mặt',
                 "Tiền phòng": b.room_total,
                 "Tiền dịch vụ": b.service_total,
                 "Tổng tiền": b.grand_total
             })));
+            applySheetBorder(wsBills);
             XLSX.utils.book_append_sheet(wb, wsBills, "ChiTiet_HoaDon");
 
             const wsInv = XLSX.utils.json_to_sheet(cachedInventory.map(i => ({
@@ -512,6 +546,7 @@
                 "Giá nhập": i.import_price,
                 "Thành tiền tồn": i.quantity * i.import_price
             })));
+            applySheetBorder(wsInv);
             XLSX.utils.book_append_sheet(wb, wsInv, "KhoHang_TonKho");
 
             const wsExp = XLSX.utils.json_to_sheet(cachedExpenses.map(e => ({
@@ -520,6 +555,7 @@
                 "Số tiền": e.amount,
                 "Ghi chú": e.note
             })));
+            applySheetBorder(wsExp);
             XLSX.utils.book_append_sheet(wb, wsExp, "ChiPhi");
 
             XLSX.writeFile(wb, "BaoCao_Karaoke_MultiSheet.xlsx");
