@@ -165,14 +165,17 @@
                     <ul class="list-group mb-3" id="order-list"></ul>
                 </div>
                 <div class="modal-footer d-flex gap-2">
-                    <button class="btn btn-warning flex-grow-1" id="checkout-btn" onclick="checkoutRoom()">Tính Tiền & In Bill</button>
-                    <button class="btn btn-danger" onclick="cancelBooking()">Hủy Giờ Đặt</button>
+                    <!-- Khách chỉ có quyền xem bill tạm tính, không được quyền check-out -->
+                    <button class="btn btn-info text-white flex-grow-1" id="view-temp-bill-btn" onclick="viewTemporaryBill()" style="display:none;">Xem Bill Tạm Tính</button>
+                    <!-- Nhân viên & Admin có quyền Tính tiền & In bill -->
+                    <button class="btn btn-warning flex-grow-1" id="checkout-btn" onclick="checkoutRoom()" style="display:none;">Tính Tiền & In Bill</button>
+                    <button class="btn btn-danger" id="cancel-booking-btn" onclick="cancelBooking()" style="display:none;">Hủy Giờ Đặt</button>
                 </div>
             </div>
         </div>
     </div>
 
-    <!-- Modal In Bill -->
+    <!-- Modal In Bill / Xác Thực Thanh Toán -->
     <div class="modal fade" id="billModal" tabindex="-1">
         <div class="modal-dialog modal-dialog-centered">
             <div class="modal-content p-4" id="printable-bill">
@@ -180,7 +183,7 @@
                     <h4 class="fw-bold mb-0" id="bill-facility-name">KARAOKE KALI</h4>
                     <small id="bill-address"></small><br><small id="bill-phone"></small>
                     <hr>
-                    <h5 class="fw-bold text-danger">HOÁ ĐƠN THANH TOÁN</h5>
+                    <h5 class="fw-bold text-danger" id="bill-title-heading">HOÁ ĐƠN THANH TOÁN</h5>
                     <p class="mb-1">Phòng: <b id="bill-room"></b> | Thời gian: <span id="bill-time"></span>h</p>
                 </div>
                 <div class="table-responsive">
@@ -197,7 +200,18 @@
                 <div class="text-center mt-3" id="bill-qr-container">
                     <p class="mb-1 small">QR Thanh toán:</p><img id="bill-qr-img" src="" style="max-height: 140px;" class="img-fluid">
                 </div>
-                <div class="text-center mt-4 d-print-none">
+                
+                <!-- Phần chọn phương thức và Xác thực (chỉ hiện khi nhân viên/admin thực hiện tính tiền) -->
+                <div id="payment-verification-section" class="mt-3 p-3 bg-light border rounded d-print-none" style="display:none;">
+                    <label class="form-label fw-bold text-primary">Chọn phương thức thanh toán:</label>
+                    <select id="payment-method-select" class="form-select mb-3">
+                        <option value="Chuyển khoản">Chuyển khoản (QR)</option>
+                        <option value="Tiền mặt">Tiền mặt</option>
+                    </select>
+                    <button class="btn btn-success w-100 fw-bold" onclick="verifyAndCompleteCheckout()">Xác Thực & Hoàn Tất Thanh Toán</button>
+                </div>
+
+                <div class="text-center mt-4 d-print-none" id="bill-print-actions" style="display:none;">
                     <button class="btn btn-primary btn-sm me-2" onclick="window.print()">In Hóa Đơn</button>
                     <button class="btn btn-secondary btn-sm" data-bs-dismiss="modal" onclick="location.reload()">Đóng</button>
                 </div>
@@ -222,6 +236,7 @@
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script>
         let menuData = [], selectedSlotsArray = [];
+        let pendingCheckoutData = null; // Lưu trữ dữ liệu checkout tạm thời chờ xác thực
 
         async function init() {
             const resSet = await fetch('/api/settings');
@@ -307,6 +322,9 @@
         }
 
         function openRoomAction(room) {
+            const user = JSON.parse(localStorage.getItem('user') || '{}');
+            const isStaffOrAdmin = user.role === 'staff' || user.role === 'admin';
+
             if(room.status === 'Trống') {
                 document.getElementById('b-room-id').value = room.id;
                 document.getElementById('b-room-name').innerText = room.room_name;
@@ -326,6 +344,19 @@
                 document.getElementById('a-customer').innerText = room.customer_name;
                 document.getElementById('a-hours').innerText = room.hours_booked;
                 loadOrders(room.id);
+
+                // Phân quyền hiển thị nút trên modal phòng đang hát
+                if(isStaffOrAdmin) {
+                    document.getElementById('view-temp-bill-btn').style.display = 'none';
+                    document.getElementById('checkout-btn').style.display = 'inline-block';
+                    document.getElementById('cancel-booking-btn').style.display = 'inline-block';
+                } else {
+                    // Khách hàng: chỉ được xem bill tạm tính, không có quyền check-out hoặc hủy lịch
+                    document.getElementById('view-temp-bill-btn').style.display = 'inline-block';
+                    document.getElementById('checkout-btn').style.display = 'none';
+                    document.getElementById('cancel-booking-btn').style.display = 'none';
+                }
+
                 new bootstrap.Modal(document.getElementById('activeRoomModal')).show();
             }
         }
@@ -335,7 +366,6 @@
             document.getElementById('slot-container').style.display = type === 'online' ? 'block' : 'none';
         }
 
-        // Hỗ trợ bật/tắt chọn nhiều múi giờ liên tục
         function toggleSlot(btn, timeStr) {
             const index = selectedSlotsArray.indexOf(timeStr);
             if (index > -1) {
@@ -370,11 +400,10 @@
             const customer_name = document.getElementById('c-name').value;
             const customer_phone = document.getElementById('c-phone').value;
             
-            // Nếu đặt online, lấy thời gian bắt đầu từ slot đầu tiên được chọn
             let start_time_custom = null;
             if(booking_type === 'online' && selectedSlotsArray.length > 0) {
                 selectedSlotsArray.sort();
-                const firstSlotTimeStr = selectedSlotsArray[0].split(' - ')[0]; // Lấy giờ mở đầu ví dụ "09:00"
+                const firstSlotTimeStr = selectedSlotsArray[0].split(' - ')[0];
                 const today = new Date().toISOString().split('T')[0];
                 start_time_custom = `${today}T${firstSlotTimeStr}:00.000Z`;
             }
@@ -399,7 +428,6 @@
             }
         }
 
-        // Chức năng hủy giờ đặt dành cho nhân viên/admin
         async function cancelBooking() {
             if(confirm('Bạn có chắc chắn muốn hủy giờ đặt/lịch phòng này không?')) {
                 const room_id = document.getElementById('a-room-id').value;
@@ -418,48 +446,109 @@
             }
         }
 
-        async function checkoutRoom() {
+        // Khách hàng xem bill tạm tính
+        async function viewTemporaryBill() {
             const room_id = document.getElementById('a-room-id').value;
-            const res = await fetch('/api/rooms/checkout', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ room_id }) });
+            const res = await fetch(`/api/rooms/temp-bill/${room_id}`);
             const data = await res.json();
             if(data.success) {
                 document.getElementById('bill-facility-name').innerText = data.setting.name;
                 document.getElementById('bill-address').innerText = `Địa chỉ: ${data.setting.address}`;
                 document.getElementById('bill-phone').innerText = `SĐT: ${data.setting.phone}`;
+                document.getElementById('bill-title-heading').innerText = 'HOÁ ĐƠN TẠM TÍNH (XEM)';
                 document.getElementById('bill-room').innerText = data.report.room_name;
                 document.getElementById('bill-time').innerText = data.report.hours;
                 document.getElementById('bill-qr-img').src = data.setting.qr_code;
 
-                let html = `<tr><td>Tiền phòng (${data.report.price_per_hour.toLocaleString()}đ/h)</td><td>${data.report.hours}h</td><td>-</td><td><b>${Number(data.report.roomTotal).toLocaleString()}đ</b></td></tr>`;
-                
-                if(data.report.foodItems.length > 0) {
-                    html += `<tr><td colspan="4" class="bg-light fw-bold">--- ĐỒ ĂN (FOOD) ---</td></tr>`;
-                    data.report.foodItems.forEach(i => html += `<tr><td>${i.item_name}</td><td>${i.quantity} ${i.unit}</td><td>${(i.total_price/i.quantity).toLocaleString()}đ</td><td>${i.total_price.toLocaleString()}đ</td></tr>`);
-                }
-                if(data.report.drinkItems.length > 0) {
-                    html += `<tr><td colspan="4" class="bg-light fw-bold">--- ĐỒ UỐNG (DRINK) ---</td></tr>`;
-                    data.report.drinkItems.forEach(i => html += `<tr><td>${i.item_name}</td><td>${i.quantity} ${i.unit}</td><td>${(i.total_price/i.quantity).toLocaleString()}đ</td><td>${i.total_price.toLocaleString()}đ</td></tr>`);
-                }
-                if(data.report.otherItems.length > 0) {
-                    html += `<tr><td colspan="4" class="bg-light fw-bold">--- KHÁC (OTHER) ---</td></tr>`;
-                    data.report.otherItems.forEach(i => html += `<tr><td>${i.item_name}</td><td>${i.quantity} ${i.unit}</td><td>${(i.total_price/i.quantity).toLocaleString()}đ</td><td>${i.total_price.toLocaleString()}đ</td></tr>`);
-                }
+                fillBillContent(data.report);
 
-                document.getElementById('bill-items').innerHTML = html;
-                document.getElementById('bill-subtotal').innerText = `${Number(data.report.subTotal).toLocaleString()}đ`;
-                
-                if(data.report.discountPercent > 0) {
-                    document.getElementById('bill-discount-row').style.display = 'block';
-                    document.getElementById('bill-discount-percent').innerText = data.report.discountPercent;
-                    document.getElementById('bill-discount-amount').innerText = `${Number(data.report.discountAmount).toLocaleString()}đ`;
-                } else {
-                    document.getElementById('bill-discount-row').style.display = 'none';
-                }
-
-                document.getElementById('bill-total').innerText = `TỔNG CỘNG: ${Number(data.report.grandTotal).toLocaleString()}đ`;
+                // Ẩn phần xác thực thanh toán vì khách chỉ xem
+                document.getElementById('payment-verification-section').style.display = 'none';
+                document.getElementById('bill-print-actions').style.display = 'block';
 
                 bootstrap.Modal.getInstance(document.getElementById('activeRoomModal')).hide();
                 new bootstrap.Modal(document.getElementById('billModal')).show();
+            }
+        }
+
+        // Nhân viên/Admin tiến hành tính tiền & in bill (chờ xác thực thanh toán)
+        async function checkoutRoom() {
+            const room_id = document.getElementById('a-room-id').value;
+            const res = await fetch('/api/rooms/checkout-preview', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ room_id }) });
+            const data = await res.json();
+            if(data.success) {
+                pendingCheckoutData = data; // Lưu lại để xác thực sau
+
+                document.getElementById('bill-facility-name').innerText = data.setting.name;
+                document.getElementById('bill-address').innerText = `Địa chỉ: ${data.setting.address}`;
+                document.getElementById('bill-phone').innerText = `SĐT: ${data.setting.phone}`;
+                document.getElementById('bill-title-heading').innerText = 'HOÁ ĐƠN THANH TOÁN';
+                document.getElementById('bill-room').innerText = data.report.room_name;
+                document.getElementById('bill-time').innerText = data.report.hours;
+                document.getElementById('bill-qr-img').src = data.setting.qr_code;
+
+                fillBillContent(data.report);
+
+                // Hiển thị phần chọn hình thức thanh toán & nút xác thực trước khi kết thúc
+                document.getElementById('payment-verification-section').style.display = 'block';
+                document.getElementById('bill-print-actions').style.display = 'none';
+
+                bootstrap.Modal.getInstance(document.getElementById('activeRoomModal')).hide();
+                new bootstrap.Modal(document.getElementById('billModal')).show();
+            }
+        }
+
+        function fillBillContent(report) {
+            let html = `<tr><td>Tiền phòng (${report.price_per_hour.toLocaleString()}đ/h)</td><td>${report.hours}h</td><td>-</td><td><b>${Number(report.roomTotal).toLocaleString()}đ</b></td></tr>`;
+            
+            if(report.foodItems.length > 0) {
+                html += `<tr><td colspan="4" class="bg-light fw-bold">--- ĐỒ ĂN (FOOD) ---</td></tr>`;
+                report.foodItems.forEach(i => html += `<tr><td>${i.item_name}</td><td>${i.quantity} ${i.unit}</td><td>${(i.total_price/i.quantity).toLocaleString()}đ</td><td>${i.total_price.toLocaleString()}đ</td></tr>`);
+            }
+            if(report.drinkItems.length > 0) {
+                html += `<tr><td colspan="4" class="bg-light fw-bold">--- ĐỒ UỐNG (DRINK) ---</td></tr>`;
+                report.drinkItems.forEach(i => html += `<tr><td>${i.item_name}</td><td>${i.quantity} ${i.unit}</td><td>${(i.total_price/i.quantity).toLocaleString()}đ</td><td>${i.total_price.toLocaleString()}đ</td></tr>`);
+            }
+            if(report.otherItems.length > 0) {
+                html += `<tr><td colspan="4" class="bg-light fw-bold">--- KHÁC (OTHER) ---</td></tr>`;
+                report.otherItems.forEach(i => html += `<tr><td>${i.item_name}</td><td>${i.quantity} ${i.unit}</td><td>${(i.total_price/i.quantity).toLocaleString()}đ</td><td>${i.total_price.toLocaleString()}đ</td></tr>`);
+            }
+
+            document.getElementById('bill-items').innerHTML = html;
+            document.getElementById('bill-subtotal').innerText = `${Number(report.subTotal).toLocaleString()}đ`;
+            
+            if(report.discountPercent > 0) {
+                document.getElementById('bill-discount-row').style.display = 'block';
+                document.getElementById('bill-discount-percent').innerText = report.discountPercent;
+                document.getElementById('bill-discount-amount').innerText = `${Number(report.discountAmount).toLocaleString()}đ`;
+            } else {
+                document.getElementById('bill-discount-row').style.display = 'none';
+            }
+
+            document.getElementById('bill-total').innerText = `TỔNG CỘNG: ${Number(report.grandTotal).toLocaleString()}đ`;
+        }
+
+        // Nhân viên/Admin xác nhận phương thức (Chuyển khoản hoặc Tiền mặt) và hoàn tất thanh toán
+        async function verifyAndCompleteCheckout() {
+            if(!pendingCheckoutData) return;
+            const paymentMethod = document.getElementById('payment-method-select').value;
+            
+            const res = await fetch('/api/rooms/checkout-confirm', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    room_id: pendingCheckoutData.room_id,
+                    payment_method: paymentMethod,
+                    report: pendingCheckoutData.report
+                })
+            });
+            const data = await res.json();
+            if(data.success) {
+                alert(`Xác thực thanh toán thành công bằng [${paymentMethod}]! Đã lưu hóa đơn và giải phóng phòng.`);
+                document.getElementById('payment-verification-section').style.display = 'none';
+                document.getElementById('bill-print-actions').style.display = 'block';
+            } else {
+                alert(data.error || 'Có lỗi xảy ra khi xác thực.');
             }
         }
 
